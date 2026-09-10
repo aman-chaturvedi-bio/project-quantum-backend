@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import io
 import os
+import uuid
+import threading
 import joblib
 import torch
 import torch.nn as nn
@@ -27,6 +29,51 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================
 # APP
 # ============================================================
+
+
+# Async prediction jobs
+prediction_jobs = {}
+prediction_lock = threading.Lock()
+
+def _run_prediction_job(job_id, image_bytes):
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        features_8d = image_to_8d(image)
+
+        with torch.no_grad():
+            logits = hybrid(features_8d)
+            probs = torch.softmax(logits, dim=1)[0]
+            malignant_prob = float(probs[1].cpu())
+
+        if malignant_prob >= 0.70:
+            risk_level = "High"
+        elif malignant_prob >= 0.40:
+            risk_level = "Moderate"
+        else:
+            risk_level = "Low"
+
+        result = {
+            "success": True,
+            "prediction": "malignant" if malignant_prob >= 0.5 else "benign",
+            "risk_level": risk_level,
+            "probabilities": {
+                "benign": float(probs[0].cpu()),
+                "malignant": malignant_prob
+            },
+            "model": "EfficientNet-B3 + 8-Qubit VQC",
+            "quantum_features": features_8d[0].detach().cpu().tolist(),
+            "disclaimer": "Research prototype for decision support only. Not a clinical diagnosis."
+        }
+
+        with prediction_lock:
+            prediction_jobs[job_id] = {"status": "completed", "result": result}
+
+    except Exception as e:
+        with prediction_lock:
+            prediction_jobs[job_id] = {
+                "status": "failed",
+                "error": str(e)
+            }
 
 app = FastAPI(
     title="PROJECT QUANTUM API",
@@ -591,3 +638,38 @@ async def predict(file: UploadFile = File(...)):
             "success": False,
             "error": str(e)
         }
+
+
+from fastapi import BackgroundTasks
+
+@app.post("/api/predict-async")
+async def predict_async(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+    image_bytes = await file.read()
+
+    job_id = str(uuid.uuid4())
+
+    with prediction_lock:
+        prediction_jobs[job_id] = {"status": "processing"}
+
+    background_tasks.add_task(_run_prediction_job, job_id, image_bytes)
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": "processing"
+    }
+
+
+@app.get("/api/predict-status/{job_id}")
+async def predict_status(job_id: str):
+    with prediction_lock:
+        job = prediction_jobs.get(job_id)
+
+    if job is None:
+        return {"success": False, "status": "not_found"}
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        **job
+    }
